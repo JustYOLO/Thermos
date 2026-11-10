@@ -1,0 +1,194 @@
+//  Copyright (c) 2026-present, Facebook, Inc.  All rights reserved.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
+
+#pragma once
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <vector>
+
+#include "db/dbformat.h"
+#include "memory/allocator.h"
+#include "rocksdb/comparator.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
+#include "table/internal_iterator.h"
+#include "util/mutexlock.h"
+
+namespace ROCKSDB_NAMESPACE {
+
+// A HotNode's index_ entry (std::map red-black node, plus the heap-allocated
+// key string copy used as the map key) costs roughly this many bytes beyond
+// the node's own tracked allocation size. Measured empirically (16-byte
+// keys, several value-size budgets); used as a fixed per-key estimate rather
+// than tracked exactly, matching how MemTable estimates its own arena/map
+// overhead elsewhere.
+constexpr size_t kHotTableIndexOverheadBytes = 128;
+
+struct HotNode {
+  SpinMutex write_lock;
+  std::atomic<uint32_t> hit_count{0};
+  std::atomic<uint32_t> seq_version{0}; // Seqlock: Even = stable, Odd = writing
+  uint32_t user_key_len{0};
+  uint32_t val_len{0};
+  uint32_t capacity{0};
+  ValueType value_type{kTypeValue};
+  SequenceNumber seq{0};
+
+  const char* UserKey() const {
+    return reinterpret_cast<const char*>(this + 1);
+  }
+  char* ValBuf() {
+    return const_cast<char*>(reinterpret_cast<const char*>(this + 1)) + user_key_len;
+  }
+  const char* ValBuf() const {
+    return reinterpret_cast<const char*>(this + 1) + user_key_len;
+  }
+};
+
+class HotMemTable {
+ public:
+  // `write_buffer_manager`, when non-null, is charged for every byte this
+  // table allocates (mirroring MemTable's own AllocTracker use), so the
+  // table's memory is visible to and enforced by the same
+  // WriteBufferManager as ordinary memtables. May be null (e.g. in unit
+  // tests that construct a HotMemTable directly), in which case no charging
+  // happens.
+  HotMemTable(const InternalKeyComparator& cmp, size_t write_buffer_size,
+              uint32_t max_val_size,
+              WriteBufferManager* write_buffer_manager = nullptr);
+  ~HotMemTable();
+
+  // In-place update for an existing hot key.
+  // Returns true if key was present and updated in-place; false if key was not found.
+  bool UpdateInPlace(const Slice& user_key, const Slice& value, ValueType type,
+                     SequenceNumber seq, uint64_t log_num = 0);
+
+  // Add a new hot key node with over-provisioned value padding.
+  bool Add(const Slice& user_key, const Slice& value, ValueType type,
+           SequenceNumber seq, uint64_t log_num = 0);
+
+  // Lock-free untorn read for a hot key.
+  // Returns true if key was found in HotTable.
+  bool Get(const Slice& user_key, std::string* value, Status* status,
+           SequenceNumber* seq_found = nullptr);
+
+  // Sweep and reset all atomic hit counters for Virtual Flush
+  void SweepHits(std::unordered_map<std::string, uint32_t>* hit_map);
+
+  // Create an InternalIterator for reading/flushing all entries
+  InternalIterator* NewIterator(Arena* arena = nullptr,
+                                size_t* out_key_count = nullptr);
+
+  std::shared_mutex& index_rwlock() const { return index_rwlock_; }
+
+  // Permanently stops accepting new writes. After Close() returns, no
+  // in-flight or future call to Add()/UpdateInPlace() can still be mutating
+  // this table -- any such call has either already fully completed (and its
+  // effect is visible to a reader that starts after Close() returns) or will
+  // return false without touching any node. This is the barrier that makes
+  // it safe to iterate/flush this table from a thread other than the writer
+  // that closed it, with no further synchronization.
+  //
+  // Closing twice is safe (idempotent).
+  void Close();
+  bool IsClosed() const { return closed_.load(std::memory_order_acquire); }
+
+  size_t ApproximateMemoryUsage() const {
+    return allocated_bytes_.load(std::memory_order_relaxed);
+  }
+
+  size_t WriteBufferSize() const { return write_buffer_size_; }
+  uint32_t MaxValueSize() const { return max_val_size_; }
+  bool IsFull() const { return ApproximateMemoryUsage() >= write_buffer_size_; }
+  bool IsEmpty() const {
+    return earliest_seq_.load(std::memory_order_relaxed) == kMaxSequenceNumber;
+  }
+  size_t KeyCount() const;
+
+  SequenceNumber GetEarliestSequenceNumber() const {
+    return earliest_seq_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t GetEarliestLogNumber() const {
+    return earliest_log_num_.load(std::memory_order_relaxed);
+  }
+
+  void SetEarliestLogNumber(uint64_t log_num) {
+    earliest_log_num_.store(log_num, std::memory_order_relaxed);
+  }
+
+  void ResetEarliestLogNumber(uint64_t log_num) {
+    earliest_log_num_.store(log_num, std::memory_order_relaxed);
+  }
+
+  // Number of flushes of memtables written while this table was active,
+  // recorded when it is sealed. Zero means it was sealed before serving even
+  // one whole memtable, so its per-key hit counts are too sparse to tell a
+  // cold key from one that simply had no chance to be written yet.
+  // REQUIRES: DB mutex held (set and read only by ColumnFamilyData).
+  void SetObservedFlushes(uint32_t n) { observed_flushes_ = n; }
+  uint32_t ObservedFlushes() const { return observed_flushes_; }
+
+  // Called once by the builder right after the last seeding Add(), before
+  // the table is visible to any other thread (not thread-safe). Records what
+  // seeding used and the growth reserve it kept per seeded key (0 if none).
+  void MarkSeedingDone(uint64_t reserve_per_key) {
+    seeded_bytes_ = ApproximateMemoryUsage();
+    seeded_keys_ = index_.size();
+    seeded_reserve_per_key_ = reserve_per_key;
+  }
+  size_t SeededBytes() const { return seeded_bytes_; }
+  size_t SeededKeys() const { return seeded_keys_; }
+  uint64_t SeededReservePerKey() const { return seeded_reserve_per_key_; }
+  // Bytes allocated since MarkSeedingDone(). The key set is fixed after
+  // seeding, so these are value slots reallocated for larger values. Safe to
+  // call concurrently with writers (approximate while they run).
+  size_t GrowthBytes() const {
+    const size_t usage = ApproximateMemoryUsage();
+    return usage > seeded_bytes_ ? usage - seeded_bytes_ : 0;
+  }
+
+ private:
+  friend class HotMemTableIterator;
+
+  struct KeyComparatorWrapper {
+    const Comparator* user_cmp;
+    bool operator()(const std::string& a, const std::string& b) const {
+      return user_cmp->Compare(a, b) < 0;
+    }
+  };
+
+  const InternalKeyComparator internal_comparator_;
+  const size_t write_buffer_size_;
+  const uint32_t max_val_size_;
+
+  std::atomic<size_t> allocated_bytes_{0};
+  std::atomic<SequenceNumber> earliest_seq_{kMaxSequenceNumber};
+  std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
+  std::atomic<bool> closed_{false};
+  uint32_t observed_flushes_{0};
+  // Set by MarkSeedingDone() before the table is published; read-only after.
+  size_t seeded_bytes_{0};
+  size_t seeded_keys_{0};
+  uint64_t seeded_reserve_per_key_{0};
+
+  mutable std::shared_mutex index_rwlock_;
+  std::map<std::string, HotNode*, KeyComparatorWrapper> index_;
+  std::vector<void*> allocated_node_ptrs_;
+
+  // Charges this table's allocations to the DB's WriteBufferManager, exactly
+  // like MemTable's own mem_tracker_: Allocate() on every node/index byte
+  // this table adds, DoneAllocating() once Close() seals it, FreeMem() on
+  // destruction. Safe to use with write_buffer_manager == nullptr (no-op).
+  AllocTracker mem_tracker_;
+};
+
+}  // namespace ROCKSDB_NAMESPACE
